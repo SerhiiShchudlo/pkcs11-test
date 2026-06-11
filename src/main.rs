@@ -28,7 +28,17 @@ fn main() -> Result<()> {
 
     let so_pin = AuthPin::new("abcdef654321".into()); // security officer pin
 
-    let slot = if let Some(s) = pkcs11.get_slots_with_token()?.into_iter().next() { 
+    let slot = pkcs11
+        .get_slots_with_token()?
+        .into_iter()
+        .find(|&s| {
+            pkcs11
+                .get_token_info(s)
+                .map(|info| info.token_initialized())
+                .unwrap_or(false)
+        });
+
+    let slot = if let Some(s) = slot {
         s
     } else {
         let empty_slot = pkcs11
@@ -45,11 +55,7 @@ fn main() -> Result<()> {
             so_session.init_pin(&AuthPin::new(USER_PIN.into()))?;
         }
 
-        pkcs11
-            .get_slots_with_token()?
-            .into_iter()
-            .next()
-            .context("token not found after initialization")?
+        empty_slot
     };
 
     // --- Session and login ---
