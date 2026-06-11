@@ -1,8 +1,12 @@
+use aes_siv::{
+    Aes256SivAead, KeyInit,
+    aead::{Aead, Payload},
+};
 use anyhow::{Context, Result};
 use cryptoki::{
     context::{CInitializeArgs, CInitializeFlags, Pkcs11},
     mechanism::Mechanism,
-    object::{Attribute, KeyType, ObjectClass},
+    object::{Attribute, AttributeType, KeyType, ObjectClass},
     session::UserType,
     types::AuthPin,
 };
@@ -18,8 +22,8 @@ Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deseru
 
 fn main() -> Result<()> {
     // --- Library initialization ---
-    let lib_path = env::var("PKCS11_MODULE")
-        .unwrap_or_else(|_| "/usr/lib/softhsm/libsofthsm2.so".to_string());
+    let lib_path =
+        env::var("PKCS11_MODULE").unwrap_or_else(|_| "/usr/lib/softhsm/libsofthsm2.so".to_string());
 
     let pkcs11 = Pkcs11::new(lib_path).context("failed to load library")?;
     pkcs11.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))?;
@@ -28,15 +32,12 @@ fn main() -> Result<()> {
 
     let so_pin = AuthPin::new("abcdef654321".into()); // security officer pin
 
-    let slot = pkcs11
-        .get_slots_with_token()?
-        .into_iter()
-        .find(|&s| {
-            pkcs11
-                .get_token_info(s)
-                .map(|info| info.token_initialized())
-                .unwrap_or(false)
-        });
+    let slot = pkcs11.get_slots_with_token()?.into_iter().find(|&s| {
+        pkcs11
+            .get_token_info(s)
+            .map(|info| info.token_initialized())
+            .unwrap_or(false)
+    });
 
     let slot = if let Some(s) = slot {
         s
@@ -63,58 +64,70 @@ fn main() -> Result<()> {
     let session = pkcs11.open_rw_session(slot)?;
     session.login(UserType::User, Some(&AuthPin::new(USER_PIN.into())))?;
 
-    // --- RSA signature ---
+    // --- HMAC-SHA256 signature ---
 
-    let pub_attrs = vec![
-        Attribute::Token(true),
-        Attribute::Private(false),
-        Attribute::Verify(true),
-        Attribute::ModulusBits(2048.into()),
-        Attribute::PublicExponent(vec![0x01, 0x00, 0x01]),
-    ];
-
-    let priv_attrs = vec![
+    let gtk_attrs = vec![
         Attribute::Token(true),
         Attribute::Sign(true),
-        Attribute::Sensitive(true),
-        Attribute::Extractable(false),
-    ];
-
-    let (pub_key, priv_key) =
-        session.generate_key_pair(&Mechanism::RsaPkcsKeyPairGen, &pub_attrs, &priv_attrs)?;
-
-    let signature = session.sign(&Mechanism::Sha256RsaPkcs, priv_key, MESSAGE)?;
-    println!(
-        "RSA signature ({} bytes), first 8 bytes: {:02x?}",
-        signature.len(),
-        &signature[..8]
-    );
-
-    session.verify(&Mechanism::Sha256RsaPkcs, pub_key, MESSAGE, &signature)?;
-    println!("RSA signature verified OK");
-
-    // --- AES-256 encryption/decryption ---
-
-    let aes_attrs = vec![
-        Attribute::Token(true),
-        Attribute::Encrypt(true),
-        Attribute::Decrypt(true),
-        Attribute::ValueLen(32.into()), // AES-256
-        Attribute::KeyType(KeyType::AES),
+        Attribute::Verify(true),
+        Attribute::ValueLen(32.into()),
+        Attribute::KeyType(KeyType::GENERIC_SECRET),
         Attribute::Class(ObjectClass::SECRET_KEY),
     ];
 
-    let aes_key = session.generate_key(&Mechanism::AesKeyGen, &aes_attrs)?;
-    let init_vector = *b"qwertyuiop123456"; // should be random and unique for every message
+    let gtk_key = session.generate_key(&Mechanism::GenericSecretKeyGen, &gtk_attrs)?;
 
-    let ciphertext = session.encrypt(&Mechanism::AesCbcPad(init_vector), aes_key, MESSAGE)?;
-    println!("AES-256 encrypted ({} bytes): {:02x?}", ciphertext.len(), &ciphertext[..16]);
+    let mic = session.sign(&Mechanism::Sha256Hmac, gtk_key, MESSAGE)?;
+    println!("HMAC-SHA256 MIC ({} bytes): {:02x?}", mic.len(), mic);
 
-    let decrypted = session.decrypt(&Mechanism::AesCbcPad(init_vector), aes_key, &ciphertext)?;
+    session.verify(&Mechanism::Sha256Hmac, gtk_key, MESSAGE, &mic)?;
+    println!("HMAC-SHA256 MIC verified OK");
+
+    // --- AES-SIV encryption ---
+
+    let ptk_attrs = vec![
+        Attribute::Token(true),
+        Attribute::Encrypt(true),
+        Attribute::Decrypt(true),
+        Attribute::Extractable(true),
+        Attribute::ValueLen(64.into()),
+        Attribute::KeyType(KeyType::GENERIC_SECRET),
+        Attribute::Class(ObjectClass::SECRET_KEY),
+    ];
+
+    let ptk_key = session.generate_key(&Mechanism::GenericSecretKeyGen, &ptk_attrs)?;
+
+    let ptk_raw = session.get_attributes(ptk_key, &[AttributeType::Value])?;
+    let Attribute::Value(ptk_bytes) = &ptk_raw[0] else {
+        anyhow::bail!("failed to extract PTK value");
+    };
+
+    let siv_key = aes_siv::Key::<Aes256SivAead>::from_slice(ptk_bytes);
+    let cipher = Aes256SivAead::new(siv_key);
+
+    let nonce = aes_siv::Nonce::default();
+    let aad = b"type=data; version=1";
+
+    let ciphertext = cipher
+        .encrypt(&nonce, Payload { msg: MESSAGE, aad })
+        .map_err(|e| anyhow::anyhow!("AES-SIV encrypt failed: {e}"))?;
     println!(
-        "AES-256 decrypted: \"{}\"",
-        String::from_utf8(decrypted)?
+        "AES-SIV ciphertext ({} bytes), first 8 bytes: {:02x?}",
+        ciphertext.len(),
+        &ciphertext[..8]
     );
+
+    let plaintext = cipher
+        .decrypt(
+            &nonce,
+            Payload {
+                msg: &ciphertext,
+                aad,
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("AES-SIV decrypt failed: {e}"))?;
+    assert_eq!(plaintext, MESSAGE);
+    println!("AES-SIV decrypted OK");
 
     Ok(())
 }
